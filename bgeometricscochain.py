@@ -2,7 +2,8 @@
 
 from datetime import date, datetime
 import os
-import sys
+import random
+import time
 import requests
 import certifi
 from pymongo import MongoClient
@@ -44,72 +45,106 @@ def subtract_years(d: date, years: int) -> date:
         return d.replace(month=2, day=28, year=d.year - years)
 
 
+def exponential_backoff(attempt: int) -> float:
+    """attempt(1부터 시작)에 따른 지수 백오프 대기 시간(초)."""
+    return (2 ** (attempt - 1)) + random.random()
+
+
 def build_params(startday: str, endday: str):
     params = {"startday": startday, "endday": endday}
     if BGEOMETRICS_TOKEN:
+        # BGeometrics(api.bitcoin-data.com) 문서는 헤더 인증을 기본으로 안내하지만,
+        # 과거에는 쿼리 파라미터 token도 허용했습니다. 두 방식 모두 보내서
+        # 어느 쪽이 맞는지 API 쪽에서 알아서 인식하게 하고, 로그로 어떤 방식이
+        # 실제로 통과했는지 나중에 확인할 수 있게 합니다.
         params["token"] = BGEOMETRICS_TOKEN
     return params
 
 
-def normalize_timeseries_item(item):
+def build_headers():
+    headers = {}
+    if BGEOMETRICS_TOKEN:
+        headers["Authorization"] = f"Bearer {BGEOMETRICS_TOKEN}"
+        headers["x-api-key"] = BGEOMETRICS_TOKEN
+    return headers
+
+
+DATE_TEXT_KEYS = ("date", "day", "d", "x")
+EPOCH_KEYS = ("unixTs", "unix_ts", "timestamp", "time")
+DATE_KEY_CANDIDATES = DATE_TEXT_KEYS + EPOCH_KEYS
+VALUE_KEY_CANDIDATES = ("value", "v", "y", "val")
+
+
+def normalize_timeseries_item(item, endpoint: str = None):
     if isinstance(item, dict):
-        date_keys = [k for k in item.keys() if k in ("date", "day", "x")]
-        value_keys = [k for k in item.keys() if k in ("value", "v", "y")]
-        d = item.get(date_keys[0]) if date_keys else item.get("date") or item.get("day")
-        v = item.get(value_keys[0]) if value_keys else None
+        date_keys = [k for k in item.keys() if k in DATE_KEY_CANDIDATES]
+        value_keys = [k for k in item.keys() if k in VALUE_KEY_CANDIDATES]
+
+        d = item.get(date_keys[0]) if date_keys else None
+        # 엔드포인트 이름 자체가 값 필드 키인 경우가 많음 (예: {"d": "...", "sopr": 1.02})
+        if endpoint and endpoint in item:
+            v = item.get(endpoint)
+        elif value_keys:
+            v = item.get(value_keys[0])
+        else:
+            v = None
+
+        # 텍스트 날짜가 없고 epoch 형태만 있는 경우 날짜 문자열로 변환
+        if d is None:
+            for k in EPOCH_KEYS:
+                if item.get(k) is not None:
+                    try:
+                        d = datetime.utcfromtimestamp(int(item[k])).strftime("%Y-%m-%d")
+                    except Exception:
+                        pass
+                    break
+
         return d, v, item
     return None, None, item
+
+
+def _safe_float(x):
+    """실패하면 조용히 None을 반환하는 float 변환."""
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
 
 
 def extract_numeric_value(raw_item):
     """Try to extract a numeric value from a raw item. Returns float or None."""
     if raw_item is None:
         return None
-    # direct numeric
-    if isinstance(raw_item, (int, float)):
-        try:
-            return float(raw_item)
-        except Exception:
-            return None
-    # string that might be numeric
-    if isinstance(raw_item, str):
-        try:
-            return float(raw_item)
-        except Exception:
-            return None
-    # dict-like: check common keys then any numeric field
+    if isinstance(raw_item, (int, float, str)):
+        return _safe_float(raw_item)
     if isinstance(raw_item, dict):
+        # 우선 흔히 쓰이는 값 필드 이름부터 확인
         for k in ("value", "v", "y", "val", "price"):
             if k in raw_item:
-                try:
-                    return float(raw_item[k])
-                except Exception:
-                    pass
-        for k, v in raw_item.items():
+                v = _safe_float(raw_item[k])
+                if v is not None:
+                    return v
+        # 없으면 dict 안의 첫 번째 숫자형 필드를 사용
+        for v in raw_item.values():
             if isinstance(v, (int, float)):
-                try:
-                    return float(v)
-                except Exception:
-                    continue
+                return float(v)
     return None
 
 
 def fetch_endpoint(session: requests.Session, base_url: str, endpoint: str, startday: str, endday: str):
-    import time
-    import random
-
     url = f"{base_url.rstrip('/')}/{endpoint}"
     params = build_params(startday, endday)
+    headers = build_headers()
 
     max_retries = 5
     for attempt in range(1, max_retries + 1):
         try:
-            resp = session.get(url, params=params, timeout=30)
+            resp = session.get(url, params=params, headers=headers, timeout=30)
         except requests.RequestException as e:
             # Network-level error: retry
             if attempt == max_retries:
                 raise
-            backoff = (2 ** (attempt - 1)) + random.random()
+            backoff = exponential_backoff(attempt)
             print(f"Network error on attempt {attempt}/{max_retries} for {endpoint}: {e}. Backing off {backoff:.1f}s")
             time.sleep(backoff)
             continue
@@ -117,10 +152,9 @@ def fetch_endpoint(session: requests.Session, base_url: str, endpoint: str, star
         if resp.status_code == 429:
             # Rate limited: respect Retry-After if present, otherwise exponential backoff
             retry_after = resp.headers.get("Retry-After")
-            try:
-                wait = float(retry_after) if retry_after is not None else (2 ** (attempt - 1)) + random.random()
-            except Exception:
-                wait = (2 ** (attempt - 1)) + random.random()
+            wait = _safe_float(retry_after) if retry_after is not None else None
+            if wait is None:
+                wait = exponential_backoff(attempt)
             print(f"Received 429 for {endpoint} (attempt {attempt}/{max_retries}). Waiting {wait:.1f}s before retrying.")
             if attempt == max_retries:
                 print(f"Max retries reached for {endpoint} after rate limiting.")
@@ -132,23 +166,35 @@ def fetch_endpoint(session: requests.Session, base_url: str, endpoint: str, star
             # Server error: retry
             if attempt == max_retries:
                 resp.raise_for_status()
-            backoff = (2 ** (attempt - 1)) + random.random()
+            backoff = exponential_backoff(attempt)
             print(f"Server error {resp.status_code} on attempt {attempt}/{max_retries} for {endpoint}. Backing off {backoff:.1f}s")
             time.sleep(backoff)
             continue
 
         # For other HTTP errors, raise immediately
-        try:
-            resp.raise_for_status()
-        except requests.HTTPError:
-            raise
-
+        resp.raise_for_status()
         return resp.json()
 
     return None
 
 
-def backfill_until_august(collection_prefix: str = "bgeometrics"):
+def extract_items(data, endpoint: str):
+    """API 응답에서 시계열 항목 리스트를 찾아 반환. 못 찾으면 None."""
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        if isinstance(data.get("data"), list):
+            return data["data"]
+        if isinstance(data.get("result"), dict) and isinstance(data["result"].get("data"), list):
+            # {"result": {"data": [...]}} 같은 중첩 형태도 지원
+            return data["result"]["data"]
+        if isinstance(data.get(endpoint), list):
+            # {"sopr": [...]} 같은 형태도 지원
+            return data[endpoint]
+    return None
+
+
+def backfill_until_august():
     end_date = compute_default_end()
     start_date = subtract_years(end_date, 4)
     startday = start_date.strftime("%Y-%m-%d")
@@ -165,8 +211,11 @@ def backfill_until_august(collection_prefix: str = "bgeometrics"):
     except ConfigurationError:
         db = client["bitcoindb"]
 
-    # Log DRY_RUN state
+    # Log DRY_RUN state and whether key env vars are actually populated (마스킹)
     print(f"DRY_RUN={DRY_RUN}")
+    print(f"BGEOMETRICS_TOKEN set: {bool(BGEOMETRICS_TOKEN)}")
+    print(f"BGEOMETRICS_BASE_URL={BGEOMETRICS_BASE_URL}")
+    print(f"MONGO_URI set: {bool(MONGO_URI)} (length={len(MONGO_URI) if MONGO_URI else 0})")
 
     # Check MongoDB connectivity (ping) before fetching data
     try:
@@ -195,27 +244,28 @@ def backfill_until_august(collection_prefix: str = "bgeometrics"):
                 print(f"Skipping endpoint {ep} due to repeated errors/rate limiting.")
                 continue
 
-            items = None
-            if isinstance(data, list):
-                items = data
-            elif isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
-                items = data["data"]
-            else:
-                # 배열이 아닌 경우, 모든 항목을 단일 문서의 raw 필드로 저장
-                doc = {"fetched_at": datetime.utcnow(), f"raw.{ep}": data}
-                # 날짜를 알 수 없으면 insert_one로 저장하지 않고 로그 출력
-                print(f"[{ep}] non-array response: stored under raw.{ep} in documents when date exists")
+            # 진단용: 실제 응답 구조를 항상 로그로 남긴다.
+            # (키 이름이 예상과 다르면 여기서 바로 드러남)
+            preview = str(data)[:500]
+            print(f"[{ep}] response type={type(data).__name__}, preview={preview}")
+
+            items = extract_items(data, ep)
+
+            if items is None:
+                print(f"[{ep}] WARNING: unrecognized response shape, skipped (nothing saved). "
+                      f"응답 구조가 예상과 달라 이 엔드포인트는 저장되지 않았습니다. 위 preview를 확인하세요.")
                 continue
 
-            ops = 0
+            ops, skipped = 0, 0
             for it in items:
-                d, v, raw = normalize_timeseries_item(it)
+                d, v, raw = normalize_timeseries_item(it, endpoint=ep)
                 if not d:
+                    skipped += 1
                     continue
-                # 우선 raw에서 숫자를 추출하고, normalize에서 추출된 v보다 우선시
-                numeric = extract_numeric_value(raw)
-                if numeric is None and v is not None:
-                    numeric = extract_numeric_value(v)
+                # 우선 엔드포인트/명시 값 필드(v)를 사용하고, 없으면 raw 전체에서 숫자를 탐색
+                numeric = extract_numeric_value(v) if v is not None else None
+                if numeric is None:
+                    numeric = extract_numeric_value(raw)
 
                 filter_q = {"date": str(d)}
                 set_fields = {ep: numeric, f"raw.{ep}": raw, "fetched_at": datetime.utcnow()}
@@ -226,7 +276,8 @@ def backfill_until_august(collection_prefix: str = "bgeometrics"):
                     coll.update_one(filter_q, update, upsert=True)
                 ops += 1
 
-            print(f"[{ep}] merged/updated {ops} documents into {coll.full_name}")
+            print(f"[{ep}] merged/updated {ops} documents into {coll.full_name} "
+                  f"({skipped} items skipped due to missing date field)")
         # Post-run summary
         try:
             if DRY_RUN:
