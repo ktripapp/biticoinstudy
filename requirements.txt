@@ -1,0 +1,5 @@
+pymongo>=4.0
+pandas
+yfinance
+certifi
+requests
