@@ -165,6 +165,19 @@ def backfill_until_august(collection_prefix: str = "bgeometrics"):
     except ConfigurationError:
         db = client["bitcoindb"]
 
+    # Log DRY_RUN state
+    print(f"DRY_RUN={DRY_RUN}")
+
+    # Check MongoDB connectivity (ping) before fetching data
+    try:
+        client.admin.command('ping')
+        print("MongoDB ping: OK")
+    except Exception as e:
+        print("MongoDB ping failed:", e)
+        # If not dry run, abort early so workflow fails loud and clear
+        if not DRY_RUN:
+            raise
+
     session = requests.Session()
 
     coll = db[SINGLE_COLLECTION]
@@ -214,6 +227,18 @@ def backfill_until_august(collection_prefix: str = "bgeometrics"):
                 ops += 1
 
             print(f"[{ep}] merged/updated {ops} documents into {coll.full_name}")
+        # Post-run summary
+        try:
+            if DRY_RUN:
+                print("DRY_RUN enabled — no DB writes performed.")
+            else:
+                total = coll.count_documents({})
+                print(f"Post-run: collection '{coll.full_name}' contains {total} documents")
+                sample = coll.find_one({}, projection={"_id": 0})
+                if sample:
+                    print("Sample document:", sample)
+        except Exception as e:
+            print("Failed to produce post-run summary:", e)
 
     finally:
         client.close()
