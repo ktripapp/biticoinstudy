@@ -843,6 +843,8 @@ def main():
 
                 # 집계 결과를 MongoDB에 업서트하거나, MongoDB가 없으면 로컬 CSV로 저장합니다.
                 if collection is not None:
+                    print(f"Aggregated rows: {len(agg)}, columns: {list(agg.columns)}")
+                    print("Sample aggregated rows:\n", agg.head().to_string(index=False))
                     upserted = 0
                     for _, row in agg.iterrows():
                         try:
@@ -852,17 +854,31 @@ def main():
                             except Exception:
                                 date_obj = pd.to_datetime(date_str, errors='coerce').date()
 
+                            # normalize date as midnight UTC datetime
+                            date_dt = datetime(date_obj.year, date_obj.month, date_obj.day, tzinfo=timezone.utc)
+                            date_str = date_dt.date().isoformat()
                             doc = {
-                                'date': datetime(date_obj.year, date_obj.month, date_obj.day, tzinfo=timezone.utc),
+                                'date': date_dt,
                                 'compound': float(row['compound']),
                                 'count': int(row['count']),
-                                'updated': datetime.utcnow()
+                                'uploaded_at': datetime.utcnow()
                             }
-                            collection.update_one({'date': doc['date']}, {'$set': doc}, upsert=True)
+                            # Filter should match either existing ISODate(datetime) or string date values
+                            filter_q = {'$or': [{'date': date_dt}, {'date': date_str}]}
+                            res = collection.update_one(filter_q, {'$set': doc}, upsert=True)
+                            try:
+                                matched = int(res.matched_count)
+                                modified = int(res.modified_count)
+                                upserted_id = str(res.upserted_id) if getattr(res, 'upserted_id', None) else None
+                            except Exception:
+                                matched = getattr(res, 'matched_count', None)
+                                modified = getattr(res, 'modified_count', None)
+                                upserted_id = getattr(res, 'upserted_id', None)
+                            print(f"Upserted date={date_str} -> matched={matched}, modified={modified}, upserted_id={upserted_id}")
                             upserted += 1
                         except Exception as e:
                             print('몽고DB 업sert 실패:', e)
-                    print(f"  ✅ MongoDB에 업로드 완료: {upserted}개 문서 (컬렉션: redditcompound)")
+                    print(f"  ✅ MongoDB에 업로드 완료(시도): {upserted}개 문서 (컬렉션: redditcompound)")
                 else:
                     try:
                         out_path = out_dir / 'reddit_compound.csv'
