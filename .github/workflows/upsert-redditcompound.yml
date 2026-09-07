@@ -1,4 +1,4 @@
-name: Redditcompound Daily Run
+name: 09:20 Daily Redditcompound Upsert (KST)
 
 on:
   schedule:
