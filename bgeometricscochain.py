@@ -6,6 +6,7 @@ import sys
 import requests
 import certifi
 from pymongo import MongoClient
+from pymongo.errors import ConfigurationError
 
 
 # 설정
@@ -29,7 +30,8 @@ ENDPOINTS = [
 ]
 
 # 단일 컬렉션 이름 (환경변수로 덮어쓰기 가능)
-SINGLE_COLLECTION = os.environ.get("onchain", "bgeometrics_timeseries")
+# 기본: 'onchain' 컬렉션, DB는 'bitcoindb' (클라이언트 명시)
+SINGLE_COLLECTION = os.environ.get("SINGLE_COLLECTION", "onchain")
 
 
 def compute_default_end():
@@ -117,7 +119,13 @@ def backfill_until_august(collection_prefix: str = "bgeometrics"):
     print(f"백필 기간: {startday} 부터 {endday} (엔드포인트: {', '.join(ENDPOINTS)})")
 
     client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
-    db = client.get_default_database() if client.get_default_database() else client["bitcoindb"]
+    # 안전하게 기본 DB를 얻고, 없으면 'bitcoindb'로 폴백
+    try:
+        db = client.get_default_database()
+        if db is None:
+            raise ConfigurationError("No default database")
+    except ConfigurationError:
+        db = client["bitcoindb"]
 
     session = requests.Session()
 
