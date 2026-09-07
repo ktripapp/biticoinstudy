@@ -17,6 +17,9 @@ if not MONGO_URI:
 BGEOMETRICS_TOKEN = os.environ.get("BGEOMETRICS_TOKEN")
 BGEOMETRICS_BASE_URL = os.environ.get("BGEOMETRICS_BASE_URL", "https://api.bitcoin-data.com/v1")
 
+# Dry run flag: when true, the script will not perform any DB writes
+DRY_RUN = os.environ.get("DRY_RUN", "false").lower() in ("1", "true", "yes")
+
 # 기본 엔드포인트: 필요에 따라 추가/제거하세요
 ENDPOINTS = [
     "sopr",
@@ -166,7 +169,10 @@ def backfill_until_august(collection_prefix: str = "bgeometrics"):
                 filter_q = {"date": str(d)}
                 set_fields = {ep: numeric, f"raw.{ep}": raw, "fetched_at": datetime.utcnow()}
                 update = {"$set": set_fields}
-                coll.update_one(filter_q, update, upsert=True)
+                if DRY_RUN:
+                    print(f"[DRY RUN] would upsert {filter_q} -> set {set_fields}")
+                else:
+                    coll.update_one(filter_q, update, upsert=True)
                 ops += 1
 
             print(f"[{ep}] merged/updated {ops} documents into {coll.full_name}")
