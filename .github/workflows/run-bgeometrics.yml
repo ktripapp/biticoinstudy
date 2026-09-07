@@ -1,4 +1,4 @@
-name: Fetch BGeometrics Data
+name: Run BGeometrics Onchain upload logs
 
 on:
   push:
