@@ -17,10 +17,8 @@ if not MONGO_URI:
 BGEOMETRICS_TOKEN = os.environ.get("BGEOMETRICS_TOKEN")
 BGEOMETRICS_BASE_URL = os.environ.get("BGEOMETRICS_BASE_URL", "https://api.bitcoin-data.com/v1")
 
-# Dry run flag: when true, the script will not perform any DB writes
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() in ("1", "true", "yes")
 
-# 기본 엔드포인트: 필요에 따라 추가/제거하세요
 ENDPOINTS = [
     "sopr",
     "mvrv",
@@ -32,20 +30,11 @@ ENDPOINTS = [
     "sender-addresses",
 ]
 
-# 단일 컬렉션 이름 (환경변수로 덮어쓰기 가능)
-# 기본: 'onchain' 컬렉션, DB는 'bitcoindb' (클라이언트 명시)
 SINGLE_COLLECTION = os.environ.get("SINGLE_COLLECTION", "onchain")
 
 
 def compute_default_end():
-    today = date.today()
-    year = today.year
-    # 오늘이 9월 이후면 올해 8월, 아니면 작년 8월
-    if today.month >= 9:
-        target_year = year
-    else:
-        target_year = year - 1
-    return date(target_year, 8, 31)
+    return date.today()
 
 
 def subtract_years(d: date, years: int) -> date:
@@ -106,11 +95,57 @@ def extract_numeric_value(raw_item):
 
 
 def fetch_endpoint(session: requests.Session, base_url: str, endpoint: str, startday: str, endday: str):
+    import time
+    import random
+
     url = f"{base_url.rstrip('/')}/{endpoint}"
     params = build_params(startday, endday)
-    resp = session.get(url, params=params, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
+
+    max_retries = 5
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = session.get(url, params=params, timeout=30)
+        except requests.RequestException as e:
+            # Network-level error: retry
+            if attempt == max_retries:
+                raise
+            backoff = (2 ** (attempt - 1)) + random.random()
+            print(f"Network error on attempt {attempt}/{max_retries} for {endpoint}: {e}. Backing off {backoff:.1f}s")
+            time.sleep(backoff)
+            continue
+
+        if resp.status_code == 429:
+            # Rate limited: respect Retry-After if present, otherwise exponential backoff
+            retry_after = resp.headers.get("Retry-After")
+            try:
+                wait = float(retry_after) if retry_after is not None else (2 ** (attempt - 1)) + random.random()
+            except Exception:
+                wait = (2 ** (attempt - 1)) + random.random()
+            print(f"Received 429 for {endpoint} (attempt {attempt}/{max_retries}). Waiting {wait:.1f}s before retrying.")
+            if attempt == max_retries:
+                print(f"Max retries reached for {endpoint} after rate limiting.")
+                return None
+            time.sleep(wait)
+            continue
+
+        if 500 <= resp.status_code < 600:
+            # Server error: retry
+            if attempt == max_retries:
+                resp.raise_for_status()
+            backoff = (2 ** (attempt - 1)) + random.random()
+            print(f"Server error {resp.status_code} on attempt {attempt}/{max_retries} for {endpoint}. Backing off {backoff:.1f}s")
+            time.sleep(backoff)
+            continue
+
+        # For other HTTP errors, raise immediately
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError:
+            raise
+
+        return resp.json()
+
+    return None
 
 
 def backfill_until_august(collection_prefix: str = "bgeometrics"):
@@ -143,6 +178,9 @@ def backfill_until_august(collection_prefix: str = "bgeometrics"):
         for ep in ENDPOINTS:
             print(f"-> Fetching endpoint: {ep}")
             data = fetch_endpoint(session, BGEOMETRICS_BASE_URL, ep, startday, endday)
+            if data is None:
+                print(f"Skipping endpoint {ep} due to repeated errors/rate limiting.")
+                continue
 
             items = None
             if isinstance(data, list):
