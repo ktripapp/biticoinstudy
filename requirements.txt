@@ -3,3 +3,5 @@ pandas
 yfinance
 certifi
 requests
+tqdm
+vaderSentiment
