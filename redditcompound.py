@@ -216,6 +216,26 @@ def sanitize_query(q: str) -> str:
     return out or "q"
 
 
+def get_mongo_client_and_collection(uri: str | None, db_name: str = "bitcoindb", coll_name: str = "redditcompound"):
+    """Try to connect to MongoDB, run a ping test, and return (client, collection) or (None, None).
+
+    Prints detailed error on failure to help CI/Actions debugging.
+    """
+    if not uri:
+        return None, None
+    try:
+        client = MongoClient(uri, tlsCAFile=certifi.where(), serverSelectionTimeoutMS=5000)
+        # quick connectivity test
+        client.admin.command('ping')
+        db = client[db_name]
+        coll = db.get_collection(coll_name)
+        print(f"Connected to MongoDB: {db_name}.{coll_name}")
+        return client, coll
+    except Exception as e:
+        print(f"MongoDB connection/test failed: {e}")
+        return None, None
+
+
 def jsonl_to_csv(jsonl_path: Path, csv_path: Path, compress: bool = True, append: bool = False):
     """JSONL(.gz) 파일을 CSV로 변환합니다. 모든 최상위 키의 union을 헤더로 사용합니다.
     주의: 큰 파일은 메모리/IO 비용이 큽니다."""
@@ -699,29 +719,29 @@ def main():
             print('Loaded MongoDB URI from environment')
 
     latest_uploaded_date = None
+    client = None
     if MONGO_URI:
-        try:
-            client = MongoClient(MONGO_URI, tlsCAFile=certifi.where(), serverSelectionTimeoutMS=5000)
-            db = client['bitcoindb']
-            collection = db.get_collection('redditcompound')
-            latest_doc = collection.find_one(sort=[('date', -1)], projection={'date': 1})
-            if latest_doc and 'date' in latest_doc and latest_doc['date'] is not None:
-                d = latest_doc['date']
-                if isinstance(d, str):
-                    try:
-                        latest_uploaded_date = datetime.fromisoformat(d).date()
-                    except Exception:
+        client, collection = get_mongo_client_and_collection(MONGO_URI, 'bitcoindb', 'redditcompound')
+        if collection is not None:
+            try:
+                latest_doc = collection.find_one(sort=[('date', -1)], projection={'date': 1})
+                if latest_doc and 'date' in latest_doc and latest_doc['date'] is not None:
+                    d = latest_doc['date']
+                    if isinstance(d, str):
+                        try:
+                            latest_uploaded_date = datetime.fromisoformat(d).date()
+                        except Exception:
+                            latest_uploaded_date = None
+                    elif hasattr(d, 'date'):
+                        latest_uploaded_date = d.date()
+                    else:
                         latest_uploaded_date = None
-                elif hasattr(d, 'date'):
-                    latest_uploaded_date = d.date()
+                    print(f'Latest uploaded date in MongoDB: {latest_uploaded_date}')
                 else:
-                    latest_uploaded_date = None
-                print(f'Latest uploaded date in MongoDB: {latest_uploaded_date}')
-            else:
-                print('MongoDB에 업로드된 날짜 정보가 없습니다 (컬렉션 비어있음).')
-        except Exception as e:
-            print('MongoDB 연결/조회 실패:', e)
-            collection = None
+                    print('MongoDB에 업로드된 날짜 정보가 없습니다 (컬렉션 비어있음).')
+            except Exception as e:
+                print('MongoDB 조회 중 오류 발생:', e)
+                collection = None
 
     # Determine date range to collect: prefer MongoDB-derived date; fallback to CONFIG if provided
     yesterday = (datetime.utcnow() - timedelta(days=1)).date()
@@ -857,6 +877,14 @@ def main():
     else:
         # 사용자가 병합을 원치 않으므로 아무 파일도 생성하지 않습니다.
         print('  ℹ️ 설정에 따라 병합 CSV 생성을 건너뜁니다.')
+
+    # Close MongoDB client if opened
+    try:
+        if 'client' in locals() and client is not None:
+            client.close()
+            print('MongoDB client closed')
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
