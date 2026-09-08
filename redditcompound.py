@@ -854,16 +854,17 @@ def main():
                             except Exception:
                                 date_obj = pd.to_datetime(date_str, errors='coerce').date()
 
-                            # normalize date as midnight UTC datetime
+                            # normalize date as midnight UTC datetime for matching, but store date as string
                             date_dt = datetime(date_obj.year, date_obj.month, date_obj.day, tzinfo=timezone.utc)
                             date_str = date_dt.date().isoformat()
+                            # Build document using string date to keep existing string representation
                             doc = {
-                                'date': date_dt,
+                                'date': date_str,
                                 'compound': float(row['compound']),
                                 'count': int(row['count']),
                                 'uploaded_at': datetime.utcnow()
                             }
-                            # Filter should match either existing ISODate(datetime) or string date values
+                            # Match either existing ISODate(datetime) or string date values, then write string
                             filter_q = {'$or': [{'date': date_dt}, {'date': date_str}]}
                             res = collection.update_one(filter_q, {'$set': doc}, upsert=True)
                             try:
