@@ -866,9 +866,10 @@ def main():
                         date_dt = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
                         date_str_norm = date_dt.date().isoformat()
 
+                        # 소수점 4자리로 반올림하여 업서트
                         doc = {
                             'date': date_str_norm,
-                            'compound': round(float(mean), 10),
+                            'compound': round(float(mean), 4),
                             'count': int(cnt),
                             'uploaded_at': datetime.utcnow()
                         }
@@ -876,7 +877,13 @@ def main():
                         try:
                             res = collection.update_one(filter_q, {'$set': doc}, upsert=True)
                             upserted_id = str(res.upserted_id) if getattr(res, 'upserted_id', None) else None
-                            print(f"Upserted(JSONL) date={date_str_norm} -> matched={res.matched_count}, modified={res.modified_count}, upserted_id={upserted_id}")
+                            # 로그에 compound(소수점4자리)와 count를 포함
+                            try:
+                                comp_str = f"{doc['compound']:.4f}"
+                            except Exception:
+                                comp_str = str(doc.get('compound'))
+                            # 출력에서 matched/modified/upserted_id는 생략하고, 날짜/compound/count만 표시
+                            print(f"Upserted(JSONL) date={date_str_norm}, compound={comp_str}, count={doc['count']}")
                             upserted += 1
                         except Exception as e:
                             print('몽고DB 업sert 실패(JSONL):', e)
@@ -972,7 +979,8 @@ def main():
                                 matched = getattr(res, 'matched_count', None)
                                 modified = getattr(res, 'modified_count', None)
                                 upserted_id = getattr(res, 'upserted_id', None)
-                            print(f"Upserted date={date_str} -> matched={matched}, modified={modified}, upserted_id={upserted_id}")
+                            # 업서트 결과의 내부 카운트는 출력하지 않고, 날짜/compound/count만 간단히 표시
+                            print(f"Upserted date={date_str}, compound={doc.get('compound')}, count={doc.get('count')}")
                             upserted += 1
                         except Exception as e:
                             print('몽고DB 업sert 실패:', e)
