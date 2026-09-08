@@ -786,9 +786,106 @@ def main():
 
     print_stats(CONFIG["output_dir"], CONFIG["compress"])
 
-    
+    # ─────────────────────────────────────────────
+    # 📊 JSONL 집계 + MongoDB 업서트
+    # save_jsonl=True 설정 시에는 CSV가 아닌 .jsonl(.gz) 파일만 생성되므로,
+    # 아래 블록에서 .jsonl 파일을 직접 읽어 날짜별로 감성점수를 집계하고 업서트합니다.
+    # (CSV 기반 병합 블록은 save_jsonl=False일 때를 위한 보조 경로로 이어서 유지됩니다.)
+    # ─────────────────────────────────────────────
+    if CONFIG.get('create_merged_csv', False):
+        try:
+            out_dir = Path(CONFIG['output_dir'])
+            ext = '.jsonl.gz' if CONFIG.get('compress', False) else '.jsonl'
+            jsonl_files = list(out_dir.glob(f"*{ext}"))
+
+            if not jsonl_files:
+                print('  ℹ️ JSONL 파일이 없습니다 (CSV 저장 모드이거나 수집된 데이터가 없을 수 있습니다). CSV 기반 병합을 시도합니다.')
+            else:
+                sums = {}
+                counts = {}
+                for jf in jsonl_files:
+                    opener = gzip.open if (jf.suffix == '.gz' or jf.name.endswith('.jsonl.gz')) else open
+                    with opener(jf, 'rt', encoding='utf-8') as fh:
+                        for line in fh:
+                            try:
+                                obj = json.loads(line)
+                            except Exception:
+                                continue
+
+                            sent_raw = obj.get('_sent_compound') if obj is not None else None
+                            try:
+                                sent_val = float(sent_raw) if sent_raw is not None else None
+                            except Exception:
+                                sent_val = None
+                            if sent_val is None or sent_val == 0.0:
+                                continue
+
+                            # 날짜 결정: 'date' 문자열 우선, 없으면 'created_utc' 타임스탬프 사용
+                            date_val = None
+                            if 'date' in obj and obj.get('date'):
+                                try:
+                                    dt = pd.to_datetime(obj.get('date'), errors='coerce')
+                                    if pd.notnull(dt):
+                                        date_val = dt.date().isoformat()
+                                except Exception:
+                                    date_val = str(obj.get('date'))
+                            elif 'created_utc' in obj and obj.get('created_utc') is not None:
+                                try:
+                                    ts = int(obj.get('created_utc'))
+                                    date_val = datetime.utcfromtimestamp(ts).date().isoformat()
+                                except Exception:
+                                    date_val = None
+                            if not date_val:
+                                continue
+
+                            sums[date_val] = sums.get(date_val, 0.0) + float(sent_val)
+                            counts[date_val] = counts.get(date_val, 0) + 1
+
+                if not sums:
+                    print('  ⚠️ JSONL 집계 결과가 없습니다 (모든 항목이 필터링되었거나 빈 파일).')
+                elif collection is None:
+                    print('  ⚠️ MongoDB 컬렉션이 없어 JSONL 집계 결과를 업로드하지 못했습니다. (MONGO_URI 확인 필요)')
+                else:
+                    upserted = 0
+                    for date_str, total in sums.items():
+                        cnt = counts.get(date_str, 0)
+                        if cnt == 0:
+                            continue
+                        mean = total / cnt
+
+                        try:
+                            d = datetime.fromisoformat(date_str).date()
+                        except Exception:
+                            pd_dt = pd.to_datetime(date_str, errors='coerce')
+                            if pd.isna(pd_dt):
+                                continue
+                            d = pd_dt.date()
+
+                        # 기존 코드와 동일한 방식: midnight UTC datetime으로 매칭(기존 ISODate 문서 호환),
+                        # 저장은 문자열 date로 유지
+                        date_dt = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+                        date_str_norm = date_dt.date().isoformat()
+
+                        doc = {
+                            'date': date_str_norm,
+                            'compound': round(float(mean), 10),
+                            'count': int(cnt),
+                            'uploaded_at': datetime.utcnow()
+                        }
+                        filter_q = {'$or': [{'date': date_dt}, {'date': date_str_norm}]}
+                        try:
+                            res = collection.update_one(filter_q, {'$set': doc}, upsert=True)
+                            upserted_id = str(res.upserted_id) if getattr(res, 'upserted_id', None) else None
+                            print(f"Upserted(JSONL) date={date_str_norm} -> matched={res.matched_count}, modified={res.modified_count}, upserted_id={upserted_id}")
+                            upserted += 1
+                        except Exception as e:
+                            print('몽고DB 업sert 실패(JSONL):', e)
+                    print(f"  ✅ JSONL 집계 기반 MongoDB 업로드 완료(시도): {upserted}개 문서 (컬렉션: redditcompound)")
+        except Exception as e:
+            print('JSONL 집계/업로드 과정에서 오류 발생:', e)
 
     # 병합 CSV 생성은 설정에 따라 수행합니다. 기본값(False)일 경우 생략합니다.
+    # (save_jsonl=False로 CSV가 실제 생성된 경우를 위한 보조 경로입니다.)
     if CONFIG.get('create_merged_csv', False):
         try:
             out_dir = Path(CONFIG['output_dir'])
