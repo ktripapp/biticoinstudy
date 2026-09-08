@@ -1,14 +1,14 @@
 """
-Reddit Bitcoin 데이터 수집기
-Arctic Shift / Pushshift API 방식으로 r/Bitcoin의 수년치 게시물과 댓글을 수집합니다.
+Reddit 비트코인 데이터 수집기
+Arctic Shift 혹은 Pushshift API를 사용하여 특정 서브레딧(r/Bitcoin 등)의 게시물과 댓글을 기간 단위로 수집합니다.
 
 지원 엔드포인트:
-  - Arctic Shift API (https://arctic-shift.photon-reddit.com)  ← 현재 가장 안정적
-  - Pushshift API (https://api.pushshift.io) ← 현재 접근 제한 있음
+    - Arctic Shift API (https://arctic-shift.photon-reddit.com)  ← 현재 권장 및 가장 안정적
+    - Pushshift API (https://api.pushshift.io) ← 백업용(최근 접근 제한이 있을 수 있음)
 
-사용법:
-  pip install requests tqdm
-  python reddit_bitcoin_collector.py
+사용법 예시:
+    pip install -r requirements.txt
+    python redditcompound.py
 """
 
 import requests
@@ -39,13 +39,13 @@ CONFIG = {
 
     # 저장 경로 — main() 실행 시 날짜 범위를 기준으로 자동 계산되어 덮어써지므로 여기서 지정할 필요 없음.
 
-    # 한 번 요청당 가져올 항목 수 (Arctic Shift 최대 100)
+    # 한 번 요청당 가져올 항목 수 (Arctic Shift 최대 100) 한꺼번에 많이 가져와지지 않음.
     "batch_size": 100,
 
     # 요청 간격 (초) — rate limit 방지
     "request_delay": 1.0,
 
-    # 재시도 횟수
+    # 재시도 횟수, 안가져와질 때 시도를 계속 해야 함.
     "max_retries": 5,
 
     # 데이터를 gzip으로 압축 저장 여부
@@ -103,58 +103,11 @@ def format_ts(ts: int) -> str:
 
 def save_jsonl(records: list, filepath: Path, compress: bool = True):
     """레코드 리스트를 JSONL (또는 .jsonl.gz) 파일에 저장."""
-    # If configured to not save JSONL, write CSV directly and return CSV path
-    if not CONFIG.get('save_jsonl', False):
-        csv_path = filepath.with_suffix('.csv')
-        csv_path.parent.mkdir(parents=True, exist_ok=True)
-        # Only keep `date` and `_sent_compound` columns.
-        fieldnames = ['date', '_sent_compound']
-        # Always append to existing CSV during a run so each batch adds rows.
-        # If the file doesn't exist, create and write header.
-        mode = 'a' if csv_path.exists() else 'w'
-        write_header = (mode == 'w')
-        with open(csv_path, mode, newline='', encoding='utf-8') as out:
-            writer = csv.DictWriter(out, fieldnames=fieldnames)
-            if write_header:
-                writer.writeheader()
-            for r in records:
-                # skip records whose sentiment compound is explicitly 0.0
-                sent_raw = r.get('_sent_compound') if r is not None else None
-                try:
-                    sent_val = float(sent_raw) if sent_raw is not None else None
-                except Exception:
-                    sent_val = None
-                if sent_val is not None and sent_val == 0.0:
-                    continue
-
-                # determine date: prefer 'date' string, else convert 'created_utc' timestamp
-                date_val = None
-                if 'date' in r and r.get('date'):
-                    try:
-                        # try to normalize to YYYY-MM-DD
-                        dt = pd.to_datetime(r.get('date'), errors='coerce')
-                        if pd.notnull(dt):
-                            date_val = dt.date().isoformat()
-                    except Exception:
-                        date_val = str(r.get('date'))
-                elif 'created_utc' in r and r.get('created_utc') is not None:
-                    try:
-                        ts = int(r.get('created_utc'))
-                        date_val = datetime.utcfromtimestamp(ts).date().isoformat()
-                    except Exception:
-                        date_val = None
-                # sentiment value
-                sent = sent_val if sent_val is not None else (r.get('_sent_compound') if r.get('_sent_compound') is not None else None)
-                writer.writerow({'date': date_val, '_sent_compound': sent})
-        return csv_path
-
-    # fallback: save JSONL as before
     if compress:
         filepath = filepath.with_suffix('.jsonl.gz')
         filepath.parent.mkdir(parents=True, exist_ok=True)
         with gzip.open(filepath, 'at', encoding='utf-8') as f:
             for r in records:
-                # skip records with explicit 0.0 sentiment
                 sent_raw = r.get('_sent_compound') if r is not None else None
                 try:
                     sent_val = float(sent_raw) if sent_raw is not None else None
@@ -167,7 +120,6 @@ def save_jsonl(records: list, filepath: Path, compress: bool = True):
         filepath.parent.mkdir(parents=True, exist_ok=True)
         with open(filepath, 'a', encoding='utf-8') as f:
             for r in records:
-                # skip records with explicit 0.0 sentiment
                 sent_raw = r.get('_sent_compound') if r is not None else None
                 try:
                     sent_val = float(sent_raw) if sent_raw is not None else None
@@ -217,9 +169,9 @@ def sanitize_query(q: str) -> str:
 
 
 def get_mongo_client_and_collection(uri: str | None, db_name: str = "bitcoindb", coll_name: str = "redditcompound"):
-    """Try to connect to MongoDB, run a ping test, and return (client, collection) or (None, None).
+    """MongoDB에 연결을 시도하고(핑 테스트 포함) (client, collection) 또는 (None, None)을 반환합니다.
 
-    Prints detailed error on failure to help CI/Actions debugging.
+    실패 시 원인 확인을 위해 상세 에러를 출력합니다.
     """
     if not uri:
         return None, None
@@ -234,126 +186,6 @@ def get_mongo_client_and_collection(uri: str | None, db_name: str = "bitcoindb",
     except Exception as e:
         print(f"MongoDB connection/test failed: {e}")
         return None, None
-
-
-def jsonl_to_csv(jsonl_path: Path, csv_path: Path, compress: bool = True, append: bool = False):
-    """JSONL(.gz) 파일을 CSV로 변환합니다. 모든 최상위 키의 union을 헤더로 사용합니다.
-    주의: 큰 파일은 메모리/IO 비용이 큽니다."""
-    opener = gzip.open if compress else open
-
-    # 1) 키 수집
-    keys = set()
-    with opener(jsonl_path, "rt", encoding="utf-8") as fh:
-        for line in fh:
-            try:
-                obj = json.loads(line)
-            except Exception:
-                continue
-            keys.update(obj.keys())
-
-    keys = sorted(keys)
-
-    # 2) 실제 쓰기
-    # If append==True and csv exists, try to append while keeping header compatibility.
-    if append and csv_path.exists():
-        # read existing header
-        with open(csv_path, "r", encoding="utf-8", newline='') as exf:
-            reader = csv.reader(exf)
-            try:
-                existing_header = next(reader)
-            except StopIteration:
-                existing_header = []
-
-        existing_keys = existing_header
-        new_keys = keys
-        union_keys = sorted(list(dict.fromkeys(existing_keys + new_keys)))
-
-        # if headers match exactly, simply append rows
-        if existing_keys == union_keys:
-            with opener(jsonl_path, "rt", encoding="utf-8") as fh, open(csv_path, "a", newline='', encoding="utf-8") as out:
-                writer = csv.DictWriter(out, fieldnames=union_keys)
-                for line in fh:
-                    try:
-                        obj = json.loads(line)
-                    except Exception:
-                        continue
-                    row = {}
-                    for k in union_keys:
-                        v = obj.get(k, "")
-                        if isinstance(v, (dict, list)):
-                            row[k] = json.dumps(v, ensure_ascii=False)
-                        else:
-                            row[k] = v
-                    writer.writerow(row)
-            return
-
-        # Headers differ: rewrite full CSV with union header to keep consistency
-        import shutil
-        tmp_path = csv_path.with_suffix('.tmp.csv')
-        with open(tmp_path, "w", newline='', encoding="utf-8") as out:
-            writer = csv.DictWriter(out, fieldnames=union_keys)
-            writer.writeheader()
-            # copy existing rows
-            with open(csv_path, "r", encoding="utf-8", newline='') as exf:
-                reader = csv.DictReader(exf)
-                for r in reader:
-                    row = {k: r.get(k, "") for k in union_keys}
-                    writer.writerow(row)
-            # append new rows
-            with opener(jsonl_path, "rt", encoding="utf-8") as fh:
-                for line in fh:
-                    try:
-                        obj = json.loads(line)
-                    except Exception:
-                        continue
-                    row = {}
-                    for k in union_keys:
-                        v = obj.get(k, "")
-                        if isinstance(v, (dict, list)):
-                            row[k] = json.dumps(v, ensure_ascii=False)
-                        else:
-                            row[k] = v
-                    writer.writerow(row)
-        # replace original
-        shutil.move(str(tmp_path), str(csv_path))
-        return
-
-    # default: write new CSV (overwrite)
-    with opener(jsonl_path, "rt", encoding="utf-8") as fh, open(csv_path, "w", newline='', encoding="utf-8") as out:
-        writer = csv.DictWriter(out, fieldnames=keys)
-        writer.writeheader()
-        for line in fh:
-            try:
-                obj = json.loads(line)
-            except Exception:
-                continue
-            # ensure only top-level simple values; convert lists/dicts to JSON string
-            row = {}
-            for k in keys:
-                v = obj.get(k, "")
-                if isinstance(v, (dict, list)):
-                    row[k] = json.dumps(v, ensure_ascii=False)
-                else:
-                    row[k] = v
-            writer.writerow(row)
-
-
-def convert_all_jsonl_to_csv(output_dir: Path, compress: bool = True, append: bool = False) -> list:
-    """output_dir 내 JSONL(.jsonl 또는 .jsonl.gz) 파일을 찾아 같은 이름으로 .csv를 생성합니다.
-    반환값: 생성된 CSV 파일 경로 리스트
-    """
-    out_dir = Path(output_dir)
-    created = []
-    ext = ".jsonl.gz" if compress else ".jsonl"
-    for f in out_dir.glob(f"*{ext}"):
-        csv_name = f.with_suffix("")  # remove .gz
-        csv_name = csv_name.with_suffix(".csv")
-        try:
-            jsonl_to_csv(f, csv_name, compress=compress, append=append)
-            created.append(csv_name)
-        except Exception as e:
-            print(f"CSV 변환 실패: {f.name} -> {e}")
-    return created
 
 
 # ─────────────────────────────────────────────
@@ -591,9 +423,8 @@ class ArcticShiftCollector:
 
 class PushshiftCollector:
     """
-    Pushshift API 백업 수집기.
-    ※ 2023년 이후 공개 Pushshift API는 접근이 제한됩니다.
-       Reddit moderator 계정이 있으면 academic access 신청 가능.
+    Pushshift API를 이용한 백업 수집기입니다.
+    참고: 2023년 이후 공개 Pushshift API는 접근이 제한될 수 있습니다. (권한이 필요할 수 있음)
     """
 
     def __init__(self, cfg: dict):
@@ -743,7 +574,7 @@ def main():
                 print('MongoDB 조회 중 오류 발생:', e)
                 collection = None
 
-    # Determine date range to collect: prefer MongoDB-derived date; fallback to CONFIG if provided
+    # 수집할 날짜 범위 결정: 우선 MongoDB에 저장된 최신 업로드 날짜를 사용하고, 없으면 CONFIG의 값 사용
     yesterday = (datetime.utcnow() - timedelta(days=1)).date()
     if latest_uploaded_date:
         start_date = latest_uploaded_date + timedelta(days=1)
@@ -788,9 +619,7 @@ def main():
 
     # ─────────────────────────────────────────────
     # 📊 JSONL 집계 + MongoDB 업서트
-    # save_jsonl=True 설정 시에는 CSV가 아닌 .jsonl(.gz) 파일만 생성되므로,
-    # 아래 블록에서 .jsonl 파일을 직접 읽어 날짜별로 감성점수를 집계하고 업서트합니다.
-    # (CSV 기반 병합 블록은 save_jsonl=False일 때를 위한 보조 경로로 이어서 유지됩니다.)
+    # 아래 블록에서 .jsonl 파일을 직접 읽어 날짜별로 감성점수를 집계하고 업서트
     # ─────────────────────────────────────────────
     if CONFIG.get('create_merged_csv', False):
         try:
@@ -891,114 +720,9 @@ def main():
         except Exception as e:
             print('JSONL 집계/업로드 과정에서 오류 발생:', e)
 
-    # 병합 CSV 생성은 설정에 따라 수행합니다. 기본값(False)일 경우 생략합니다.
-    # (save_jsonl=False로 CSV가 실제 생성된 경우를 위한 보조 경로입니다.)
+    # CSV 기반 병합/변환 코드는 제거되었습니다. 이 스크립트의 기본 워크플로우는 JSONL(.jsonl/.jsonl.gz) 기반입니다.
     if CONFIG.get('create_merged_csv', False):
-        try:
-            out_dir = Path(CONFIG['output_dir'])
-            csv_files = list(out_dir.glob('comments_*.csv')) + list(out_dir.glob('submissions_*.csv'))
-            parts = []
-            for f in csv_files:
-                try:
-                    df = pd.read_csv(f, dtype={'date': str})
-                except Exception as e:
-                    print(f'CSV 읽기 실패, 건너뜀: {f.name} -> {e}')
-                    continue
-                if '_sent_compound' in df.columns:
-                    sent_col = '_sent_compound'
-                elif 'compound' in df.columns:
-                    sent_col = 'compound'
-                else:
-                    print(f"컬럼 '_sent_compound'/'compound' 없음, 건너뜀: {f.name}")
-                    continue
-
-                if 'count' in df.columns:
-                    count_col = 'count'
-                else:
-                    count_col = None
-
-                keep_cols = ['date', sent_col]
-                if count_col:
-                    keep_cols.append(count_col)
-
-                df = df.loc[:, keep_cols]
-                df = df.dropna(subset=['date', sent_col])
-                df[sent_col] = pd.to_numeric(df[sent_col], errors='coerce')
-                df = df[df[sent_col] != 0.0]
-
-                df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.date.astype(str)
-                df = df.dropna(subset=['date'])
-
-                if count_col:
-                    df['count'] = pd.to_numeric(df[count_col], errors='coerce').fillna(1).astype(int)
-                else:
-                    df['count'] = 1
-
-                df = df.rename(columns={sent_col: '_sent_compound'})
-                parts.append(df.loc[:, ['date', '_sent_compound', 'count']])
-
-            if parts:
-                merged = pd.concat(parts, ignore_index=True)
-                agg_sent = merged.groupby('date', as_index=False)['_sent_compound'].mean()
-                agg_count = merged.groupby('date', as_index=False)['count'].sum()
-                agg = pd.merge(agg_sent, agg_count, on='date')
-                agg = agg.rename(columns={'_sent_compound': 'compound', 'count': 'count'})
-                agg['compound'] = agg['compound'].round(10)
-
-                # 집계 결과를 MongoDB에 업서트하거나, MongoDB가 없으면 로컬 CSV로 저장합니다.
-                if collection is not None:
-                    print(f"Aggregated rows: {len(agg)}, columns: {list(agg.columns)}")
-                    print("Sample aggregated rows:\n", agg.head().to_string(index=False))
-                    upserted = 0
-                    for _, row in agg.iterrows():
-                        try:
-                            date_str = row['date']
-                            try:
-                                date_obj = datetime.fromisoformat(date_str).date()
-                            except Exception:
-                                date_obj = pd.to_datetime(date_str, errors='coerce').date()
-
-                            # normalize date as midnight UTC datetime for matching, but store date as string
-                            date_dt = datetime(date_obj.year, date_obj.month, date_obj.day, tzinfo=timezone.utc)
-                            date_str = date_dt.date().isoformat()
-                            # Build document using string date to keep existing string representation
-                            doc = {
-                                'date': date_str,
-                                'compound': float(row['compound']),
-                                'count': int(row['count']),
-                                'uploaded_at': datetime.utcnow()
-                            }
-                            # Match either existing ISODate(datetime) or string date values, then write string
-                            filter_q = {'$or': [{'date': date_dt}, {'date': date_str}]}
-                            res = collection.update_one(filter_q, {'$set': doc}, upsert=True)
-                            try:
-                                matched = int(res.matched_count)
-                                modified = int(res.modified_count)
-                                upserted_id = str(res.upserted_id) if getattr(res, 'upserted_id', None) else None
-                            except Exception:
-                                matched = getattr(res, 'matched_count', None)
-                                modified = getattr(res, 'modified_count', None)
-                                upserted_id = getattr(res, 'upserted_id', None)
-                            # 업서트 결과의 내부 카운트는 출력하지 않고, 날짜/compound/count만 간단히 표시
-                            print(f"Upserted date={date_str}, compound={doc.get('compound')}, count={doc.get('count')}")
-                            upserted += 1
-                        except Exception as e:
-                            print('몽고DB 업sert 실패:', e)
-                    print(f"  ✅ MongoDB에 업로드 완료(시도): {upserted}개 문서 (컬렉션: redditcompound)")
-                else:
-                    try:
-                        out_path = out_dir / 'reddit_compound.csv'
-                        agg.to_csv(out_path, index=False)
-                        print(f"  ✅ 병합 CSV 생성 완료: {out_path} ({len(agg)}개 행)")
-                    except Exception as e:
-                        print('병합 결과 CSV 저장 실패:', e)
-            else:
-                print('  ⚠️ 병합할 파일 기반 데이터가 없습니다.')
-        except Exception as e:
-            print('병합(파일 기반) 과정에서 오류 발생:', e)
-    else:
-        # 사용자가 병합을 원치 않으므로 아무 파일도 생성하지 않습니다.
-        print('  ℹ️ 설정에 따라 병합 CSV 생성을 건너뜁니다.')
+        print('  ℹ️ CSV 병합 관련 코드는 제거되었습니다. JSONL 집계만 수행됩니다.')
 
     # Close MongoDB client if opened
     try:
