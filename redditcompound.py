@@ -30,6 +30,8 @@ CONFIG = {
 BITCOIN_KEYWORDS = [
     "bitcoin", "btc", "satoshi", "sats", "hodl", "halving",
     "bitcoin cash", "wrapped bitcoin", "wbtc",
+    "btc price", "bitcoin price", "bitcoin etf",
+    "bitcoin mining", "bitcoin network", "bitcoin dominance",
 ]
 # 위 키워드들을 하나의 정규식으로 결합 (단어 경계 \b 사용, 대소문자 무시)
 BITCOIN_PATTERN = re.compile(
@@ -125,7 +127,12 @@ def is_bitcoin_related(text):
     """텍스트에 비트코인 관련 키워드가 포함되어 있는지 확인합니다."""
     if not text:
         return False
-    return BITCOIN_PATTERN.search(text) is not None
+    # casefold()를 사용해 대소문자 및 일부 유니코드 변이에 강건하게 매칭합니다.
+    text_cf = text.casefold()
+    for kw in BITCOIN_KEYWORDS:
+        if re.search(r"\b" + re.escape(kw.casefold()) + r"\b", text_cf):
+            return True
+    return False
 
 
 def analyze_sentiment(record, text, analyzer):  # 감성분석 점수를 계산하는 함수
